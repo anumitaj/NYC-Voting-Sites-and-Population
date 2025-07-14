@@ -1,0 +1,461 @@
+---
+title: "R Programming Sample"
+author: "Anumita Jain"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+
+# Introduction
+
+Welcome to my R programming sample!
+
+In this program, I look at the locations of voting poll sites in New York City relative to population density and determine whether population is a strong predictor of the number of voting poll sites in a census tract I then also incorporate a few demographic variables into the model to determine if there are any other predictors of the number of voting poll sites in a census tract.
+
+Using open source NYC poll site data as well as census data, I will quality check, modify, merge, visualize, and model this data to answer my questions of 1) whether population is a statistically significant predictor of the number of voting poll sites in a census tract and 2) whether other demographic variables, such as race and income, are statistically significant predictors of the number of voting poll sites in a census tract when accounting for population.
+
+# Libraries
+
+```{r, message = F, warning = F}
+
+library(tidyverse)      # for general programming
+library(tidycensus)     # for importing census data
+library(tidygeocoder)   # for geocoding addresses
+library(sf)             # for manipulating spatial data
+library(tmap)           # for creating maps
+
+```
+
+
+# Import data
+
+```{r, message = FALSE}
+
+# Voting poll site data
+pollsites <- read_csv("Voting_Poll_Sites.csv")
+pollsites %>% glimpse()
+
+# Census population data (census tract level)
+nyc_pop <- tidycensus::get_acs(geography = "tract", variables = "B01003_001", state = "NY", county = c("New York", "Kings", "Queens", "Bronx", "Richmond"), geometry = TRUE)
+nyc_pop %>% glimpse()
+
+# Other census demographic variables (census tract level)
+nyc_demo <- tidycensus::get_acs(geography = "tract", variables = c(
+  "B17026_001", # ratio of income to poverty level
+  "B03001_003", # ethnicity: hispanic or latino
+  "B03002_003", # race: white alone, not hispanic or latino
+  "B03002_004", # race: black or african american alone, not hispanic or latino
+  "B03002_005", # race: native american alone, not hispanic or latino
+  "B03002_006", # race: asian alone, not hispanic or latino
+  "B03002_007", # race: native hawaiian or pacific islander alone, not hispanic or latino
+  "B03002_008", # race: other race alone, not hispanic or latino
+  "B03002_009" # race: two or more races, not hispanic or latino
+
+), state = "NY", county = c("New York", "Kings", "Queens", "Bronx", "Richmond"))
+nyc_demo %>% glimpse()
+
+```
+
+# Data quality check
+
+## Poll site data
+
+This dataset from NYC Open Data contains geographical information about each of the voting poll sites in New York City. In addition to standard data quality checks, goal here is to assess if there is any missingness that would impact the merge to the census data
+
+```{r}
+
+# Check for full duplicates
+pollsites %>% 
+  group_by_all() %>%
+  filter(n()>1) # 0 rows
+
+# Check for partial duplicates on site number
+pollsites %>%
+  group_by(SITE_NUMBER) %>% 
+  filter(n()>1) # 0 rows
+
+# Check for missingness across all columns
+colSums(is.na(pollsites))
+
+```
+
+Since the census tract variable is not in the same format as the one in the census population data, I will be merging these two datasets using their spatial geometry. However, 134 rows are missing a latitude and a longitude, so I will geocode them to obtain their coordinates later on.
+
+
+## Census population data
+
+```{r, message=F}
+
+# Check for full duplicates
+nyc_pop %>% 
+  group_by_all() %>%
+  filter(n()>1) # 0 rows
+
+# Check for partial duplicates on census tract
+nyc_pop %>%
+  group_by(GEOID) %>% 
+  filter(n()>1) # 0 rows
+
+# Check for missingness across all columns
+colSums(is.na(nyc_pop)) # no missing values
+
+```
+
+Thankfully, the census population data appears to be already clean.
+
+
+## Other census demographic data
+
+```{r}
+
+# Check for full duplicates
+nyc_demo %>% 
+  group_by_all() %>%
+  filter(n()>1) # 0 rows
+
+# Check for partial duplicates on census tract and variable
+nyc_demo %>%
+  group_by(GEOID, variable) %>% 
+  filter(n()>1) # 0 rows
+
+# Check for missingness across all columns
+colSums(is.na(nyc_demo)) # no missing values
+
+```
+
+# Prepare to merge
+
+## Geocode
+
+In order to geocode the 124 poll site rows that are missing coordinates, I first have to create a single address variable to feed into the function. First, I need to fix the street name variable so that it has the appropriate suffixes after any numbers (ex: 144th St instead of 144 St). 
+
+```{r}
+
+# Isolate rows that need to be geocoded
+to_geocode <- pollsites %>% filter(is.na(Latitude) & is.na(Longitude))
+
+# Fix street name variable
+to_geocode2 <- to_geocode %>% mutate(street_new = str_replace_all(
+    STREET_NAME,
+    "(\\b\\d+\\b)(?!(st|nd|rd|th))", # use regular expressions to identify numbers in the street name variable that do not already have a suffix
+    function(x) {
+      num <- as.integer(x) # extract the number from these rows
+      suffix <- if (num %% 100 >= 11 && num %% 100 <= 13) { # address outliers 11 and 13 which end in "th" instead of "st" or "rd"
+        "th"
+      } else {
+        switch(as.character(num %% 10), # extract the last digit of the number to assign it the proper suffix
+               "1" = "st",
+               "2" = "nd",
+               "3" = "rd",
+               "th")
+      }
+      paste0(num, suffix) # add the suffix to the number
+    }
+  ))
+
+# Check that the new street name variable looks correct
+to_geocode2 %>% 
+  filter(str_detect(street_new, "\\d")) %>% # only look at rows that have a number in the street name
+  count(street_new) # print all instances of this
+
+# Create singular address variable
+to_geocode3 <- to_geocode2 %>% mutate(address = paste0(STREET_NUMBER, " ", street_new, ", ", CITY, ", ", "NY ", POSTCODE))
+
+# Check that address looks correct
+to_geocode3 %>% select(STREET_NUMBER, street_new, CITY, POSTCODE, address)
+
+```
+
+
+```{r}
+
+# Geocode
+geocoded_addresses <- to_geocode3 %>% geocode(address)
+
+# Check that all addresses were geocoded
+geocoded_addresses %>% filter(is.na(lat) | is.na(long)) %>% select(address, lat, long)
+```
+
+There are three addresses that didn't get geocoded. I'm going to manually edit these addresses and try again
+
+```{r}
+
+# Isolate rows that didn't get geocoded
+not_geo <- geocoded_addresses %>% filter(is.na(lat) | is.na(long)) %>%
+  select(-c(lat, long)) # drop lat and long variables to avoid duplication later
+
+# Fix their addresses
+not_geo <- not_geo %>% mutate(address = case_when(
+  address == "110-04 Atlantic Avenue, South Richmond Hill, NY 11419" ~ "110-04 Atlantic Avenue, Richmond Hill, NY 11419",
+  address == "105-25 Horace Harding Expressway North, Corona, NY 11368" ~ "105-25 Horace Harding Expy, Corona, NY 11368",
+  address == "71-50 Parsons Boulevard, Fresh Meadows, NY 11365" ~ "71-50 Parsons Blvd, Flushing, NY 11365"
+))
+
+# Geocode
+not_geo_geocoded <- not_geo %>% geocode(address)
+
+# Check that all addresses were geocoded
+not_geo_geocoded %>% filter(is.na(lat) | is.na(long)) %>% select(address, lat, long)
+
+```
+
+Now all rows are geocoded! I'm going to stack the two sets of geocoded addresses and then add them back into the original dataset.
+
+```{r}
+
+# Remove 3 non-geocoded rows from original geocoded address dataset
+geocoded_addresses2 <- geocoded_addresses %>% filter(!is.na(lat) & !is.na(long))
+
+# Check that only 3 rows are missing
+isTRUE(geocoded_addresses2 %>% nrow() == geocoded_addresses %>% nrow() - 3)
+
+# Stack geocoded addresses
+all_geocoded_addresses <- geocoded_addresses2 %>% rbind(not_geo_geocoded)
+
+# Check row counts
+isTRUE(all_geocoded_addresses %>% nrow() == geocoded_addresses2 %>% nrow() + 3)
+isTRUE(all_geocoded_addresses %>% nrow() == geocoded_addresses %>% nrow())
+
+# Make columns match original dataset
+all_geocoded_addresses2 <- all_geocoded_addresses %>% mutate(Latitude = lat, Longitude = long) %>% select(-c(address, lat, long, street_new))
+
+# Remove these rows from original dataset
+pollsites2 <- pollsites %>% filter(!is.na(Latitude) & !is.na(Longitude))
+
+# Check that exactly 124 rows are missing
+isTRUE(pollsites2 %>% nrow() == pollsites %>% nrow() - 124)
+
+# Add geocoded rows back to original dataset
+pollsites3 <- pollsites2 %>% rbind(all_geocoded_addresses2)
+
+# Check row counts
+isTRUE(pollsites3 %>% nrow() == pollsites2 %>% nrow() + 124)
+isTRUE(pollsites3 %>% nrow() == pollsites %>% nrow())
+
+# Check that all rows have a latitude and longitude
+pollsites3 %>% filter(is.na(Latitude) | is.na(Longitude))
+
+```
+
+
+## Prepare demographic census data
+
+I also need to prepare the demographic census data I loaded for a merge later on.
+
+```{r}
+
+# Income to poverty ratio
+nyc_income <- nyc_demo %>% filter(variable=="B17026_001") %>% mutate(Variable = "Income to poverty ratio") %>% rename(`Income to poverty ratio` = estimate)
+
+# Check that only one variable remains
+nyc_income %>% count(variable, Variable)
+
+```
+
+
+```{r}
+# Race
+nyc_race <- nyc_demo %>% filter(variable!="B17026_001") %>% 
+  mutate(Race = case_when( # Create labels for race variables
+    variable=="B03001_003" ~ "Hispanic or Latino of any race",
+    variable=="B03002_003" ~ "White alone, not Hispanic or Latino",
+    variable=="B03002_004" ~ "Black or African American alone, not Hispanic or Latino",
+    variable=="B03002_005" ~ "Native American alone, not Hispanic or Latino",
+    variable=="B03002_006" ~ "Asian alone, not Hispanic or Latino",
+    variable=="B03002_007" ~ "Native Hawaiian or Pacific Islander alone, not Hispanic or Latino",
+    variable=="B03002_008" ~ "Other race alone, not Hispanic or Latino",
+    variable=="B03002_009" ~ "Two or more races, not Hispanic or Latino",
+    )) %>%
+  group_by(GEOID) %>% mutate(Total_pop = sum(estimate)) %>% # create a total population for each census tract
+  ungroup() %>% mutate(Pct_pop = estimate/Total_pop*100) # create percentages of each race for each census tract
+
+# Check creation of new race variable
+nyc_race %>% count(Race, variable)
+
+# Pivot dataset
+nyc_race2 <- nyc_race %>% select(-c(variable, moe)) %>% pivot_wider(names_from = Race, values_from = c(estimate, Pct_pop))
+
+# Check creation of total population and percent variables
+nyc_race2 %>% filter(Total_pop!=`estimate_Hispanic or Latino of any race`+`estimate_White alone, not Hispanic or Latino`+`estimate_Black or African American alone, not Hispanic or Latino`+`estimate_Native American alone, not Hispanic or Latino`+`estimate_Asian alone, not Hispanic or Latino`+`estimate_Native Hawaiian or Pacific Islander alone, not Hispanic or Latino`+`estimate_Other race alone, not Hispanic or Latino`+`estimate_Two or more races, not Hispanic or Latino`)
+
+nyc_race2 %>% filter(`Pct_pop_Hispanic or Latino of any race`!= `estimate_Hispanic or Latino of any race`/Total_pop*100)
+nyc_race2 %>% filter(`Pct_pop_White alone, not Hispanic or Latino` != `estimate_White alone, not Hispanic or Latino`/Total_pop*100)
+nyc_race2 %>% filter(`Pct_pop_Black or African American alone, not Hispanic or Latino` != `estimate_Black or African American alone, not Hispanic or Latino`/Total_pop*100)
+nyc_race2 %>% filter(`Pct_pop_Native American alone, not Hispanic or Latino` != `estimate_Native American alone, not Hispanic or Latino`/Total_pop*100)
+nyc_race2 %>% filter(`Pct_pop_Asian alone, not Hispanic or Latino` != `estimate_Asian alone, not Hispanic or Latino`/Total_pop*100)
+nyc_race2 %>% filter(`Pct_pop_Native Hawaiian or Pacific Islander alone, not Hispanic or Latino` != `estimate_Native Hawaiian or Pacific Islander alone, not Hispanic or Latino`/Total_pop*100)
+nyc_race2 %>% filter(`Pct_pop_Other race alone, not Hispanic or Latino` != `estimate_Other race alone, not Hispanic or Latino`/Total_pop*100)
+nyc_race2 %>% filter(`Pct_pop_Two or more races, not Hispanic or Latino` != `estimate_Two or more races, not Hispanic or Latino`/Total_pop*100)
+
+```
+
+
+
+# Merge
+
+I will now merge the poll site data to the census population data using spatial geometry.
+
+```{r}
+
+# Convert coordinates to a spatial object
+pollsites_sf <- st_as_sf(pollsites3, coords = c("Longitude", "Latitude"), crs = st_crs(nyc_pop))
+
+# Create "in" variables to check merge later on
+pollsites_sf2 <- pollsites_sf %>% mutate(inPOLL = 1)
+nyc_pop2 <- nyc_pop %>% mutate(inCENSUS = 1)
+
+# Spatially join the two datasets
+merged_df <- st_join(nyc_pop2, pollsites_sf2, left = TRUE)
+
+# Check merge
+merged_df %>% count(inPOLL, inCENSUS)
+
+```
+
+All rows were merged successfully. 
+
+Now, I will merge this data to the demographic datasets I created earlier to use later on.
+
+```{r}
+
+# Create "in" variables to check merge later on
+nyc_race3 <- nyc_race2 %>% mutate(inRACE = 1)
+nyc_income2 <- nyc_income %>% mutate(inINCOME = 1)
+merged_df2 <- merged_df %>% mutate(inMERGE = 1)
+
+# Merge
+merged_df3 <- merged_df2 %>% full_join(nyc_race3, by = "GEOID")
+
+# Check first merge
+merged_df3 %>% count(inMERGE, inRACE) 
+
+# Merge again
+merged_df4 <- merged_df3 %>% full_join(nyc_income2, by = "GEOID")
+
+# Check final merge
+merged_df4 %>% count(inMERGE, inRACE, inINCOME)
+
+```
+
+Now that the data is all cleaned and merged, I'm going to visualize the poll site locations relative to population density. 
+
+# Visualize
+
+I will visualize the poll site locations relative to population density one borough at a time.
+
+## Manhattan
+
+```{r}
+
+tmap_mode("view")
+
+manhattan_map <- tm_shape(nyc_pop %>% filter(grepl("New York County", NAME))) + tm_fill(fill = "estimate", fill.scale = tm_scale(breaks = c(0, 1000, 2000, 3000, 5000, 10000, 15000, 20000)), fill_alpha = 0.7) + tm_shape(pollsites_sf %>% filter(BOROUGH=="MANHATTAN")) + tm_dots(fill = "navy")
+
+manhattan_map
+
+```
+
+
+## Brooklyn
+
+```{r}
+
+brooklyn_map <- tm_shape(nyc_pop %>% filter(grepl("Kings County", NAME))) + tm_fill(fill = "estimate", fill.scale = tm_scale(breaks = c(0, 1000, 2000, 3000, 5000, 10000, 15000, 20000)), fill_alpha = 0.7) + tm_shape(pollsites_sf %>% filter(BOROUGH=="BROOKLYN")) + tm_dots(fill = "navy")
+
+brooklyn_map
+
+```
+
+
+## Queens
+
+```{r}
+
+queens_map <- tm_shape(nyc_pop %>% filter(grepl("Queens County", NAME))) + tm_fill(fill = "estimate", fill.scale = tm_scale(breaks = c(0, 1000, 2000, 3000, 5000, 10000, 15000, 20000)), fill_alpha = 0.7) + tm_shape(pollsites_sf %>% filter(BOROUGH=="QUEENS")) + tm_dots(fill = "navy")
+
+queens_map
+
+```
+
+
+## Bronx
+
+```{r}
+
+bronx_map <- tm_shape(nyc_pop %>% filter(grepl("Bronx County", NAME))) + tm_fill(fill = "estimate", fill.scale = tm_scale(breaks = c(0, 1000, 2000, 3000, 5000, 10000, 15000, 20000)), fill_alpha = 0.7) + tm_shape(pollsites_sf %>% filter(BOROUGH=="BRONX")) + tm_dots(fill = "navy")
+
+bronx_map
+
+```
+
+
+## Staten Island
+
+```{r}
+
+si_map <- tm_shape(nyc_pop %>% filter(grepl("Richmond County", NAME))) + tm_fill(fill = "estimate", fill.scale = tm_scale(breaks = c(0, 1000, 2000, 3000, 5000, 10000, 15000, 20000)), fill_alpha = 0.7) + tm_shape(pollsites_sf %>% filter(BOROUGH=="STATEN IS")) + tm_dots(fill = "navy")
+
+si_map
+
+```
+
+
+It looks like poll sites are pretty evenly distributed in terms of population density, but I'm now going to model the data to make sure that is actually true.
+
+
+# Linear model
+
+I am going to be running a linear model on the merged data to test my hypothesis that population is a predictor of the number of poll sites in a census tract.
+
+First, I need to prepare the data for the model by identifying how many poll sites are in each census tract.
+
+```{r}
+
+# Create new dataset with number of poll sites by census tract
+census_tract <- merged_df4 %>% group_by(GEOID) %>% mutate(n_pollsite = sum(!is.na(SITE_NAME)))
+
+# Check that there are 2327 unique census tracts
+census_tract %>% distinct(GEOID) %>% nrow()
+
+# Check that poll site numbers are within reason
+max(census_tract$n_pollsite)
+min(census_tract$n_pollsite)
+
+# Collapse to 1 row per census tract
+census_tract2 <- census_tract %>% select(estimate, GEOID, n_pollsite, `Income to poverty ratio`, `Pct_pop_Hispanic or Latino of any race`, `Pct_pop_White alone, not Hispanic or Latino`, `Pct_pop_Black or African American alone, not Hispanic or Latino`, `Pct_pop_Native American alone, not Hispanic or Latino`, `Pct_pop_Asian alone, not Hispanic or Latino`, `Pct_pop_Native Hawaiian or Pacific Islander alone, not Hispanic or Latino`, `Pct_pop_Other race alone, not Hispanic or Latino`, `Pct_pop_Two or more races, not Hispanic or Latino`) %>% distinct()
+census_tract2 %>% nrow() # should be 2327
+
+```
+
+Next, I will run the model.
+
+```{r}
+
+population_model <- lm(n_pollsite ~ estimate, data = census_tract2)
+
+population_model %>% summary()
+
+```
+
+Population is a statistically significant predictor of the number of poll sites in a neighborhood. I am also going to add a few other demographic variables to the model to see if there are any confounding variables, or any other predictors of the number of poll sites. 
+
+```{r}
+
+population_demo_model <- lm(n_pollsite ~ estimate + `Income to poverty ratio` + `Pct_pop_Hispanic or Latino of any race` + `Pct_pop_White alone, not Hispanic or Latino` + `Pct_pop_Black or African American alone, not Hispanic or Latino` + `Pct_pop_Native American alone, not Hispanic or Latino` + `Pct_pop_Asian alone, not Hispanic or Latino` + `Pct_pop_Native Hawaiian or Pacific Islander alone, not Hispanic or Latino` + `Pct_pop_Other race alone, not Hispanic or Latino` + `Pct_pop_Two or more races, not Hispanic or Latino`, data = census_tract2)
+
+population_demo_model %>% summary()
+
+```
+
+# Conclusion
+
+As shown in the last linear model, the only variable that is a statistically significant predictor of the number of voting poll sites in a census tract is its population. The distribution of race and the income to poverty ratio of census tracts all do not appear to affect the number of poll sites found in that neighborhood. 
